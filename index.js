@@ -9,6 +9,7 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import cors from 'cors';
 import { Boom } from '@hapi/boom';
+import { usePostgresAuthState } from 'postgres-baileys';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -29,12 +30,6 @@ const logger = pino({
   level: process.env.LOG_LEVEL || 'info'
 });
 
-// Almacenamiento de auth en memoria (para Railway)
-let authState = {
-  creds: null,
-  keys: {}
-};
-
 // Inicializar WhatsApp
 async function connectToWhatsApp() {
   try {
@@ -42,20 +37,23 @@ async function connectToWhatsApp() {
     
     logger.info(`Using Baileys v${version.join('.')}, isLatest: ${isLatest}`);
 
-    // Si no hay credenciales, inicializar vacías
-    if (!authState.creds) {
-      authState.creds = {};
-      authState.keys = {};
+    // Usar PostgreSQL para almacenar la sesión
+    const DATABASE_URL = process.env.DATABASE_URL || process.env.PGURL;
+    
+    if (!DATABASE_URL) {
+      throw new Error('DATABASE_URL no está configurada. Agrega una base de datos PostgreSQL en Railway.');
     }
+
+    const { state, saveCreds } = await usePostgresAuthState({
+      connectionString: DATABASE_URL,
+      sessionId: 'lorena-whatsapp'
+    });
 
     sock = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
-      auth: {
-        creds: authState.creds,
-        keys: authState.keys
-      },
+      auth: state,
       getMessage: async () => ({ conversation: 'Hello' }),
       browser: ['Esika Lorena', 'Chrome', '10.0.0'],
       syncFullHistory: false,
@@ -101,10 +99,7 @@ async function connectToWhatsApp() {
       }
     });
 
-    sock.ev.on('creds.update', (creds) => {
-      authState.creds = creds;
-      logger.info('✅ Credenciales actualizadas en memoria');
-    });
+    sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       logger.info(`📨 Nuevo mensaje recibido (${type})`);
