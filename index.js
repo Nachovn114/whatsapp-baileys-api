@@ -6,7 +6,6 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import express from 'express';
 import QRCode from 'qrcode';
-import qrTerminal from 'qrcode-terminal';
 import pino from 'pino';
 import cors from 'cors';
 import { Boom } from '@hapi/boom';
@@ -25,15 +24,9 @@ let isConnected = false;
 let connectionAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
-// Logger con más detalle
+// Logger simplificado para producción
 const logger = pino({ 
-  level: process.env.LOG_LEVEL || 'info',
-  transport: {
-    target: 'pino-pretty',
-    options: {
-      colorize: true
-    }
-  }
+  level: process.env.LOG_LEVEL || 'info'
 });
 
 // Inicializar WhatsApp
@@ -63,8 +56,6 @@ async function connectToWhatsApp() {
 
       if (qr) {
         logger.info('📱 QR Code generado');
-        console.log('\n🔲 ESCANEA ESTE QR CON WHATSAPP:\n');
-        qrTerminal.generate(qr, { small: true });
         
         try {
           qrCodeData = await QRCode.toDataURL(qr);
