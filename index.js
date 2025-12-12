@@ -10,7 +10,7 @@ import pino from 'pino';
 import cors from 'cors';
 import { Boom } from '@hapi/boom';
 import postgresBaileys from 'postgres-baileys';
-const { usePostgresAuthState } = postgresBaileys;
+const { usePostgreSQLAuthState } = postgresBaileys;
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -45,7 +45,7 @@ async function connectToWhatsApp() {
       throw new Error('DATABASE_URL no está configurada. Agrega una base de datos PostgreSQL en Railway.');
     }
 
-    const { state, saveCreds } = await usePostgresAuthState({
+    const { state, saveCreds } = await usePostgreSQLAuthState({
       connectionString: DATABASE_URL,
       sessionId: 'lorena-whatsapp'
     });
