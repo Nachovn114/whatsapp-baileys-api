@@ -1,17 +1,15 @@
-import pkg from '@whiskeysockets/baileys';
-const { 
-  default: makeWASocket,
+import makeWASocket, { 
   DisconnectReason, 
   fetchLatestBaileysVersion,
-  useMultiFileAuthState
-} = pkg;
+  useMultiFileAuthState,
+  makeCacheableSignalKeyStore
+} from '@whiskeysockets/baileys';
 import express from 'express';
 import QRCode from 'qrcode';
 import pino from 'pino';
 import cors from 'cors';
-import pg from 'pg';
+import fs from 'fs';
 
-const { Client } = pg;
 const app = express();
 const PORT = process.env.PORT || 8080;
 
@@ -25,257 +23,162 @@ let qrCodeData = null;
 let isConnected = false;
 let connectionAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
+let lastError = null;
 
-// Logger simplificado
+// Logger
 const logger = pino({ 
-  level: process.env.LOG_LEVEL || 'info'
+  level: 'info',
+  transport: {
+    target: 'pino-pretty',
+    options: { colorize: false }
+  }
 });
 
-// Función para inicializar la base de datos
-async function initDatabase() {
-  const DATABASE_URL = process.env.DATABASE_URL || process.env.PGURL;
-  
-  if (!DATABASE_URL) {
-    logger.error('❌ DATABASE_URL no configurada');
-    return false;
+// Asegurar directorio de sesión
+const AUTH_DIR = './auth_session';
+try {
+  if (!fs.existsSync(AUTH_DIR)) {
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+    logger.info('📁 Directorio creado:', AUTH_DIR);
   }
-
-  try {
-    const client = new Client({ connectionString: DATABASE_URL });
-    
-    await client.connect();
-    logger.info('🔌 Conectado a PostgreSQL');
-    
-    // Eliminar tabla anterior si existe
-    await client.query('DROP TABLE IF EXISTS auth_state CASCADE');
-    logger.info('🗑️ Tabla anterior eliminada');
-    
-    // Crear tabla correcta
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS auth_state (
-        key VARCHAR(255) PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-    logger.info('✅ Tabla auth_state creada correctamente');
-    
-    await client.end();
-    return true;
-  } catch (error) {
-    logger.error('❌ Error inicializando base de datos:', error.message);
-    return false;
-  }
-}
-
-// Custom Auth State usando PostgreSQL
-async function usePostgresAuthState() {
-  const DATABASE_URL = process.env.DATABASE_URL || process.env.PGURL;
-  
-  if (!DATABASE_URL) {
-    logger.warn('⚠️ DATABASE_URL no configurada, usando filesystem temporal');
-    return await useMultiFileAuthState('./auth_session');
-  }
-
-  const readData = async (key) => {
-    const client = new Client({ connectionString: DATABASE_URL });
-    try {
-      await client.connect();
-      const result = await client.query(
-        'SELECT value FROM auth_state WHERE key = $1',
-        [key]
-      );
-      await client.end();
-      
-      if (result.rows.length > 0) {
-        return JSON.parse(result.rows[0].value);
-      }
-      return null;
-    } catch (error) {
-      logger.error(`❌ Error leyendo ${key}:`, error.message);
-      try { await client.end(); } catch (e) {}
-      return null;
-    }
-  };
-
-  const writeData = async (key, data) => {
-    const client = new Client({ connectionString: DATABASE_URL });
-    try {
-      await client.connect();
-      await client.query(
-        `INSERT INTO auth_state (key, value, updated_at) 
-         VALUES ($1, $2, NOW()) 
-         ON CONFLICT (key) 
-         DO UPDATE SET value = $2, updated_at = NOW()`,
-        [key, JSON.stringify(data)]
-      );
-      await client.end();
-    } catch (error) {
-      logger.error(`❌ Error escribiendo ${key}:`, error.message);
-      try { await client.end(); } catch (e) {}
-    }
-  };
-
-  const removeData = async (key) => {
-    const client = new Client({ connectionString: DATABASE_URL });
-    try {
-      await client.connect();
-      await client.query('DELETE FROM auth_state WHERE key = $1', [key]);
-      await client.end();
-    } catch (error) {
-      logger.error(`❌ Error eliminando ${key}:`, error.message);
-      try { await client.end(); } catch (e) {}
-    }
-  };
-
-  const creds = await readData('creds') || undefined;
-  
-  return {
-    state: {
-      creds,
-      keys: {
-        get: async (type, ids) => {
-          const data = {};
-          for (const id of ids) {
-            const key = `${type}-${id}`;
-            const value = await readData(key);
-            if (value) {
-              data[id] = value;
-            }
-          }
-          return data;
-        },
-        set: async (data) => {
-          const promises = [];
-          for (const category in data) {
-            for (const id in data[category]) {
-              const key = `${category}-${id}`;
-              const value = data[category][id];
-              if (value === null) {
-                promises.push(removeData(key));
-              } else {
-                promises.push(writeData(key, value));
-              }
-            }
-          }
-          await Promise.all(promises);
-        }
-      }
-    },
-    saveCreds: async () => {
-      if (sock && sock.authState && sock.authState.creds) {
-        await writeData('creds', sock.authState.creds);
-      }
-    }
-  };
+} catch (err) {
+  logger.error('❌ Error creando directorio:', err.message);
 }
 
 // Inicializar WhatsApp
 async function connectToWhatsApp() {
   try {
-    logger.info('🔄 Iniciando conexión a WhatsApp...');
+    logger.info('🔄 Iniciando conexión...');
     
+    // 1. Obtener versión de Baileys
+    logger.info('📦 Obteniendo versión de Baileys...');
     const { version, isLatest } = await fetchLatestBaileysVersion();
-    logger.info(`📦 Using Baileys v${version.join('.')}, isLatest: ${isLatest}`);
+    logger.info(`✅ Baileys v${version.join('.')}, isLatest: ${isLatest}`);
 
-    // Usar auth state de PostgreSQL o filesystem
+    // 2. Cargar auth state
     logger.info('📂 Cargando auth state...');
-    const { state, saveCreds } = await usePostgresAuthState();
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     logger.info('✅ Auth state cargado');
 
-    logger.info('🔌 Creando socket de WhatsApp...');
+    // 3. Crear socket
+    logger.info('🔌 Creando socket...');
     sock = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
-      printQRInTerminal: false,
-      auth: state,
-      browser: ['Esika Lorena Bot', 'Chrome', '120.0.0'],
+      printQRInTerminal: true,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+      },
+      browser: ['Esika Bot', 'Chrome', '120.0.0'],
       syncFullHistory: false,
-      markOnlineOnConnect: true,
       getMessage: async () => undefined
     });
     
-    logger.info('✅ Socket de WhatsApp creado');
+    logger.info('✅ Socket creado');
 
+    // 4. Event: Connection update
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
       
-      logger.info(`📡 Connection Update: ${JSON.stringify({ 
-        connection, 
-        hasQR: !!qr, 
-        hasError: !!lastDisconnect?.error 
-      })}`);
+      logger.info(`📡 Connection: ${connection}, QR: ${!!qr}`);
 
       if (qr) {
-        logger.info('📱 QR Code generado');
-        
+        logger.info('📱 ¡QR Code generado!');
         try {
           qrCodeData = await QRCode.toDataURL(qr);
-          logger.info('✅ QR Code convertido a imagen exitosamente');
+          logger.info('✅ QR convertido a imagen');
         } catch (err) {
-          logger.error('❌ Error generando QR imagen:', err.message);
+          logger.error('❌ Error QR:', err.message);
+          lastError = `Error generando QR: ${err.message}`;
         }
       }
 
       if (connection === 'close') {
         const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const errorMessage = lastDisconnect?.error?.message || 'Unknown error';
+        const reason = lastDisconnect?.error?.output?.payload?.error || 'unknown';
         
-        logger.warn(`❌ Conexión cerrada. StatusCode: ${statusCode}, Error: ${errorMessage}, Reconectar: ${shouldReconnect}`);
+        logger.warn(`❌ Cerrado - Code: ${statusCode}, Reason: ${reason}`);
+        lastError = `Conexión cerrada: ${reason} (${statusCode})`;
         isConnected = false;
         qrCodeData = null;
         
         if (shouldReconnect && connectionAttempts < MAX_RECONNECT_ATTEMPTS) {
           connectionAttempts++;
-          logger.info(`🔄 Reintentando conexión (${connectionAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
-          setTimeout(() => connectToWhatsApp(), 3000);
+          logger.info(`🔄 Reintento ${connectionAttempts}/${MAX_RECONNECT_ATTEMPTS}...`);
+          setTimeout(() => connectToWhatsApp(), 5000);
         } else if (connectionAttempts >= MAX_RECONNECT_ATTEMPTS) {
-          logger.error('❌ Máximo de reintentos alcanzado. Reinicia el servidor.');
+          logger.error('❌ Máximo de reintentos');
+          lastError = 'Máximo de reintentos alcanzado';
           connectionAttempts = 0;
         }
       } else if (connection === 'open') {
-        logger.info('✅ WhatsApp conectado exitosamente!');
+        logger.info('✅ ¡CONECTADO A WHATSAPP!');
         isConnected = true;
         qrCodeData = null;
         connectionAttempts = 0;
+        lastError = null;
       } else if (connection === 'connecting') {
-        logger.info('🔄 Conectando a WhatsApp...');
+        logger.info('🔄 Conectando...');
       }
     });
 
+    // 5. Event: Credentials update
     sock.ev.on('creds.update', saveCreds);
 
+    // 6. Event: Messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      logger.info(`📨 Nuevo mensaje recibido (${type})`);
+      const msg = messages[0];
+      if (!msg.key.fromMe && msg.message) {
+        logger.info(`📨 Mensaje de ${msg.key.remoteJid}: ${msg.message.conversation || 'media'}`);
+      }
     });
 
-    logger.info('✅ Conexión a WhatsApp iniciada correctamente');
+    logger.info('✅ Todo configurado correctamente');
 
   } catch (error) {
-    logger.error('❌ Error en connectToWhatsApp:', error.message);
-    logger.error('📋 Error completo:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
-    logger.error('🔍 Stack trace:', error.stack);
+    // Captura detallada del error
+    logger.error('❌ ERROR CAPTURADO EN CATCH:');
+    logger.error(`   Tipo: ${typeof error}`);
+    logger.error(`   Nombre: ${error?.name}`);
+    logger.error(`   Mensaje: ${error?.message}`);
+    logger.error(`   Code: ${error?.code}`);
+    
+    if (error?.stack) {
+      logger.error('   Stack:', error.stack);
+    }
+    
+    // Log del objeto completo
+    console.error('\n========== ERROR COMPLETO ==========');
+    console.error(error);
+    console.error('====================================\n');
+    
+    lastError = error?.message || 'Error desconocido al conectar';
     
     connectionAttempts++;
     if (connectionAttempts < MAX_RECONNECT_ATTEMPTS) {
-      logger.info(`🔄 Reintentando en 5 segundos... (${connectionAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+      logger.info(`🔄 Reintentando en 5s (${connectionAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
       setTimeout(() => connectToWhatsApp(), 5000);
     } else {
-      logger.error('❌ Máximo de reintentos alcanzado. No se pudo conectar a WhatsApp.');
+      logger.error('❌ No se pudo conectar después de múltiples intentos');
+      lastError = 'Falló después de múltiples intentos';
       connectionAttempts = 0;
     }
   }
 }
 
-// Rutas API
+// ========== RUTAS API ==========
+
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'Baileys WhatsApp API',
-    version: '1.0.3',
+    version: '1.0.5',
     connected: isConnected,
     hasQR: !!qrCodeData,
+    connectionAttempts,
+    lastError,
     timestamp: new Date().toISOString()
   });
 });
@@ -284,24 +187,40 @@ app.get('/qr', async (req, res) => {
   if (isConnected) {
     return res.json({
       status: 'connected',
-      message: 'WhatsApp ya está conectado. No se necesita QR.'
+      message: 'WhatsApp ya está conectado'
     });
   }
 
   if (!qrCodeData) {
     return res.json({
       status: 'waiting',
-      message: 'Esperando QR Code... Intenta de nuevo en 2-3 segundos',
-      hint: 'El servidor está generando el QR. Recarga esta página.',
-      connectionAttempts
+      message: 'Esperando QR Code...',
+      hint: 'Recarga en 3-5 segundos',
+      connectionAttempts,
+      lastError
     });
   }
 
   res.json({
     status: 'qr_ready',
     qrcode: qrCodeData,
-    message: 'Escanea este QR con WhatsApp → Dispositivos vinculados → Vincular dispositivo'
+    message: 'Escanea con WhatsApp → Dispositivos vinculados'
   });
+});
+
+app.get('/qr-image', async (req, res) => {
+  if (!qrCodeData) {
+    return res.status(404).send('QR no disponible aún');
+  }
+  
+  const base64Data = qrCodeData.replace(/^data:image\/png;base64,/, '');
+  const imgBuffer = Buffer.from(base64Data, 'base64');
+  
+  res.writeHead(200, {
+    'Content-Type': 'image/png',
+    'Content-Length': imgBuffer.length
+  });
+  res.end(imgBuffer);
 });
 
 app.get('/status', (req, res) => {
@@ -310,6 +229,7 @@ app.get('/status', (req, res) => {
     hasQR: !!qrCodeData,
     connectionAttempts,
     maxAttempts: MAX_RECONNECT_ATTEMPTS,
+    lastError,
     timestamp: new Date().toISOString()
   });
 });
@@ -317,8 +237,8 @@ app.get('/status', (req, res) => {
 app.post('/send-message', async (req, res) => {
   if (!isConnected || !sock) {
     return res.status(400).json({
-      error: 'WhatsApp no está conectado',
-      hint: 'Escanea el QR Code primero en /qr'
+      error: 'WhatsApp no conectado',
+      hint: 'Escanea el QR en /qr'
     });
   }
 
@@ -326,28 +246,27 @@ app.post('/send-message', async (req, res) => {
 
   if (!phone || !message) {
     return res.status(400).json({
-      error: 'Se requiere phone y message',
-      example: { phone: '56912345678', message: 'Hola!' }
+      error: 'Faltan parámetros',
+      required: { phone: '56912345678', message: 'Hola!' }
     });
   }
 
   try {
-    const formattedPhone = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
-    
-    await sock.sendMessage(formattedPhone, { text: message });
+    const jid = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
+    await sock.sendMessage(jid, { text: message });
     
     logger.info(`✅ Mensaje enviado a ${phone}`);
     
     res.json({
       success: true,
-      message: 'Mensaje enviado correctamente',
+      message: 'Enviado',
       to: phone,
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    logger.error('❌ Error enviando mensaje:', error);
+    logger.error('❌ Error enviando:', error.message);
     res.status(500).json({
-      error: 'Error al enviar mensaje',
+      error: 'Error al enviar',
       details: error.message
     });
   }
@@ -355,36 +274,30 @@ app.post('/send-message', async (req, res) => {
 
 app.post('/send-image', async (req, res) => {
   if (!isConnected || !sock) {
-    return res.status(400).json({
-      error: 'WhatsApp no está conectado'
-    });
+    return res.status(400).json({ error: 'WhatsApp no conectado' });
   }
 
   const { phone, imageUrl, caption } = req.body;
 
   if (!phone || !imageUrl) {
     return res.status(400).json({
-      error: 'Se requiere phone y imageUrl'
+      error: 'Faltan parámetros',
+      required: { phone: '56912345678', imageUrl: 'https://...' }
     });
   }
 
   try {
-    const formattedPhone = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
-    
-    await sock.sendMessage(formattedPhone, {
+    const jid = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
+    await sock.sendMessage(jid, {
       image: { url: imageUrl },
       caption: caption || ''
     });
     
     logger.info(`✅ Imagen enviada a ${phone}`);
     
-    res.json({
-      success: true,
-      message: 'Imagen enviada correctamente',
-      to: phone
-    });
+    res.json({ success: true, to: phone });
   } catch (error) {
-    logger.error('❌ Error enviando imagen:', error);
+    logger.error('❌ Error:', error.message);
     res.status(500).json({
       error: 'Error al enviar imagen',
       details: error.message
@@ -392,41 +305,37 @@ app.post('/send-image', async (req, res) => {
   }
 });
 
-// Health check para Railway
 app.get('/health', (req, res) => {
-  res.status(200).json({ 
+  res.json({ 
     status: 'healthy',
     uptime: process.uptime(),
     connected: isConnected
   });
 });
 
-// Iniciar servidor
-app.listen(PORT, async () => {
-  logger.info(`🚀 Servidor corriendo en puerto ${PORT}`);
-  logger.info(`🌐 Endpoints disponibles:`);
-  logger.info(`   GET  / - Estado del servidor`);
-  logger.info(`   GET  /qr - Obtener QR Code`);
-  logger.info(`   GET  /status - Estado de conexión`);
-  logger.info(`   POST /send-message - Enviar mensaje`);
-  logger.info(`   POST /send-image - Enviar imagen`);
+// ========== INICIAR SERVIDOR ==========
+
+app.listen(PORT, () => {
+  logger.info(`🚀 Servidor en puerto ${PORT}`);
+  logger.info(`📍 Endpoints:`);
+  logger.info(`   GET  / - Estado`);
+  logger.info(`   GET  /qr - QR JSON`);
+  logger.info(`   GET  /qr-image - QR Imagen`);
+  logger.info(`   GET  /status - Estado`);
+  logger.info(`   POST /send-message`);
+  logger.info(`   POST /send-image`);
   
-  // Inicializar base de datos primero
-  logger.info(`🔧 Inicializando base de datos...`);
-  await initDatabase();
-  
-  logger.info(`📱 Conectando a WhatsApp...`);
+  logger.info(`\n📱 Conectando a WhatsApp...`);
   connectToWhatsApp();
 });
 
-// Manejo de errores no capturados
+// Manejo de errores globales
 process.on('unhandledRejection', (err) => {
-  logger.error('❌ Unhandled Rejection:', err.message);
-  logger.error('📋 Stack:', err.stack);
+  logger.error('❌ Unhandled Rejection:', err?.message);
+  console.error('UNHANDLED:', err);
 });
 
 process.on('uncaughtException', (err) => {
-  logger.error('❌ Uncaught Exception:', err.message);
-  logger.error('📋 Stack:', err.stack);
-  // No salir inmediatamente en Railway
+  logger.error('❌ Uncaught Exception:', err?.message);
+  console.error('UNCAUGHT:', err);
 });

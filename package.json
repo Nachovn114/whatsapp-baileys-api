@@ -1,27 +1,24 @@
 {
   "name": "whatsapp-baileys-api",
   "version": "1.0.1",
-  "description": "WhatsApp API using Baileys for Lorena's E-commerce",
-  "main": "index.js",
+  "description": "WhatsApp API using Baileys",
   "type": "module",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js"
   },
-  "keywords": ["whatsapp", "baileys", "api"],
-  "author": "Lorena",
-  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",
-    "@hapi/boom": "^10.0.1",
     "express": "^4.21.2",
     "qrcode": "^1.5.4",
     "pino": "^9.5.0",
+    "pino-pretty": "^11.0.0",
     "cors": "^2.8.5",
-    "postgres-baileys": "^1.0.0",
-    "pg": "^8.11.3"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "pg": "^8.11.3",
+    "@hapi/boom": "^10.0.1"
   }
 }
