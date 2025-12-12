@@ -2,13 +2,17 @@ import pkg from '@whiskeysockets/baileys';
 const { 
   default: makeWASocket,
   DisconnectReason, 
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  useMultiFileAuthState
 } = pkg;
 import express from 'express';
 import QRCode from 'qrcode';
 import pino from 'pino';
 import cors from 'cors';
 import { Boom } from '@hapi/boom';
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -24,7 +28,7 @@ let isConnected = false;
 let connectionAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
-// Logger simplificado para producción
+// Logger simplificado
 const logger = pino({ 
   level: process.env.LOG_LEVEL || 'info'
 });
@@ -52,18 +56,13 @@ async function initDatabase() {
     
     // Crear tabla correcta
     await client.query(`
-      CREATE TABLE IF NOT EXISTS auth_data (
-        session_id VARCHAR(255) NOT NULL,
-        data_key VARCHAR(255) NOT NULL,
-        data_value TEXT,
-        PRIMARY KEY (session_id, data_key)
+      CREATE TABLE IF NOT EXISTS auth_state (
+        key VARCHAR(255) PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    logger.info('✅ Tabla auth_data creada correctamente');
-    
-    // Crear índice
-    await client.query('CREATE INDEX IF NOT EXISTS idx_session_id ON auth_data(session_id)');
-    logger.info('✅ Índice creado');
+    logger.info('✅ Tabla auth_state creada correctamente');
     
     await client.end();
     return true;
@@ -73,137 +72,107 @@ async function initDatabase() {
   }
 }
 
-// Función para crear auth state personalizado con PostgreSQL
-async function useCustomPostgresAuthState(sessionId) {
+// Custom Auth State usando PostgreSQL
+async function usePostgresAuthState() {
   const DATABASE_URL = process.env.DATABASE_URL || process.env.PGURL;
   
   if (!DATABASE_URL) {
-    throw new Error('DATABASE_URL no configurada');
+    logger.warn('⚠️ DATABASE_URL no configurada, usando filesystem temporal');
+    return await useMultiFileAuthState('./auth_session');
   }
 
   const { default: pg } = await import('pg');
   const { Client } = pg;
-  const client = new Client({ connectionString: DATABASE_URL });
-  await client.connect();
-
-  // Leer datos de la sesión
+  
   const readData = async (key) => {
+    const client = new Client({ connectionString: DATABASE_URL });
     try {
+      await client.connect();
       const result = await client.query(
-        'SELECT data_value FROM auth_data WHERE session_id = $1 AND data_key = $2',
-        [sessionId, key]
+        'SELECT value FROM auth_state WHERE key = $1',
+        [key]
       );
+      await client.end();
+      
       if (result.rows.length > 0) {
-        return JSON.parse(result.rows[0].data_value);
+        return JSON.parse(result.rows[0].value);
       }
       return null;
     } catch (error) {
       logger.error(`Error leyendo ${key}:`, error.message);
+      await client.end();
       return null;
     }
   };
 
-  // Escribir datos de la sesión
   const writeData = async (key, data) => {
+    const client = new Client({ connectionString: DATABASE_URL });
     try {
+      await client.connect();
       await client.query(
-        `INSERT INTO auth_data (session_id, data_key, data_value) 
-         VALUES ($1, $2, $3) 
-         ON CONFLICT (session_id, data_key) 
-         DO UPDATE SET data_value = $3`,
-        [sessionId, key, JSON.stringify(data)]
+        `INSERT INTO auth_state (key, value, updated_at) 
+         VALUES ($1, $2, NOW()) 
+         ON CONFLICT (key) 
+         DO UPDATE SET value = $2, updated_at = NOW()`,
+        [key, JSON.stringify(data)]
       );
+      await client.end();
     } catch (error) {
       logger.error(`Error escribiendo ${key}:`, error.message);
+      await client.end();
     }
   };
 
-  // Leer credenciales
-  let creds = await readData('creds');
+  const removeData = async (key) => {
+    const client = new Client({ connectionString: DATABASE_URL });
+    try {
+      await client.connect();
+      await client.query('DELETE FROM auth_state WHERE key = $1', [key]);
+      await client.end();
+    } catch (error) {
+      logger.error(`Error eliminando ${key}:`, error.message);
+      await client.end();
+    }
+  };
+
+  const creds = await readData('creds') || undefined;
   
-  if (!creds) {
-    // Generar credenciales manualmente
-    const crypto = await import('crypto');
-    const { Curve, signedKeyPair } = await import('@whiskeysockets/baileys/lib/Utils/crypto.js');
-    
-    const identityKeyPair = Curve.generateKeyPair();
-    const signedPreKey = signedKeyPair(identityKeyPair, 1);
-    const registrationId = crypto.randomBytes(2).readUInt16BE(0) & 0x3fff;
-    
-    creds = {
-      noiseKey: {
-        private: Buffer.from(Curve.generateKeyPair().private).toString('base64'),
-        public: Buffer.from(Curve.generateKeyPair().public).toString('base64')
-      },
-      signedIdentityKey: {
-        private: Buffer.from(identityKeyPair.private).toString('base64'),
-        public: Buffer.from(identityKeyPair.public).toString('base64')
-      },
-      signedPreKey: {
-        keyPair: {
-          private: Buffer.from(signedPreKey.keyPair.private).toString('base64'),
-          public: Buffer.from(signedPreKey.keyPair.public).toString('base64')
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          for (const id of ids) {
+            const key = `${type}-${id}`;
+            const value = await readData(key);
+            if (value) {
+              data[id] = value;
+            }
+          }
+          return data;
         },
-        signature: Buffer.from(signedPreKey.signature).toString('base64'),
-        keyId: signedPreKey.keyId
-      },
-      registrationId,
-      advSecretKey: crypto.randomBytes(32).toString('base64'),
-      nextPreKeyId: 1,
-      firstUnuploadedPreKeyId: 1,
-      serverHasPreKeys: false,
-      account: {
-        details: Buffer.from([]).toString('base64'),
-        accountSignatureKey: Buffer.from([]).toString('base64'),
-        accountSignature: Buffer.from([]).toString('base64'),
-        deviceSignature: Buffer.from([]).toString('base64')
-      },
-      me: undefined,
-      signalIdentities: [],
-      myAppStateKeyId: undefined,
-      platform: 'unknown'
-    };
-    
-    await writeData('creds', creds);
-    logger.info('🆕 Credenciales iniciales creadas');
-  } else {
-    logger.info('📂 Credenciales existentes cargadas');
-  }
-
-  // Leer keys
-  const keys = await readData('keys') || {};
-
-  const state = {
-    creds,
-    keys: {
-      get: async (type, ids) => {
-        const data = {};
-        for (const id of ids) {
-          const key = `${type}-${id}`;
-          const value = keys[key];
-          if (value) {
-            data[id] = value;
+        set: async (data) => {
+          const promises = [];
+          for (const category in data) {
+            for (const id in data[category]) {
+              const key = `${category}-${id}`;
+              const value = data[category][id];
+              if (value === null) {
+                promises.push(removeData(key));
+              } else {
+                promises.push(writeData(key, value));
+              }
+            }
           }
+          await Promise.all(promises);
         }
-        return data;
-      },
-      set: async (data) => {
-        for (const category in data) {
-          for (const id in data[category]) {
-            const key = `${category}-${id}`;
-            keys[key] = data[category][id];
-          }
-        }
-        await writeData('keys', keys);
       }
+    },
+    saveCreds: async () => {
+      await writeData('creds', sock.authState.creds);
     }
   };
-
-  const saveCreds = async () => {
-    await writeData('creds', state.creds);
-  };
-
-  return { state, saveCreds, client };
 }
 
 // Inicializar WhatsApp
@@ -213,33 +182,35 @@ async function connectToWhatsApp() {
     
     logger.info(`Using Baileys v${version.join('.')}, isLatest: ${isLatest}`);
 
-    // Usar almacenamiento en memoria simple
-    const { useMultiFileAuthState } = await import('@whiskeysockets/baileys');
-    const { state, saveCreds } = await useMultiFileAuthState('./auth_session');
+    // Usar auth state de PostgreSQL o filesystem
+    const { state, saveCreds } = await usePostgresAuthState();
 
     sock = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
       auth: state,
-      getMessage: async () => ({ conversation: 'Hello' }),
-      browser: ['Esika Lorena', 'Chrome', '10.0.0'],
+      browser: ['Esika Lorena Bot', 'Chrome', '120.0.0'],
       syncFullHistory: false,
-      markOnlineOnConnect: true
+      markOnlineOnConnect: true,
+      getMessage: async () => undefined
     });
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
       
-      // Log completo para debugging
-      logger.info(`📡 Connection Update: ${JSON.stringify({ connection, hasQR: !!qr, hasError: !!lastDisconnect?.error })}`);
+      logger.info(`📡 Connection Update: ${JSON.stringify({ 
+        connection, 
+        hasQR: !!qr, 
+        hasError: !!lastDisconnect?.error 
+      })}`);
 
       if (qr) {
         logger.info('📱 QR Code generado');
         
         try {
           qrCodeData = await QRCode.toDataURL(qr);
-          logger.info('✅ QR Code convertido a imagen');
+          logger.info('✅ QR Code convertido a imagen exitosamente');
         } catch (err) {
           logger.error('❌ Error generando QR imagen:', err);
         }
@@ -248,10 +219,11 @@ async function connectToWhatsApp() {
       if (connection === 'close') {
         const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const errorMessage = lastDisconnect?.error?.message;
+        const errorMessage = lastDisconnect?.error?.message || 'Unknown error';
         
         logger.warn(`❌ Conexión cerrada. StatusCode: ${statusCode}, Error: ${errorMessage}, Reconectar: ${shouldReconnect}`);
         isConnected = false;
+        qrCodeData = null;
         
         if (shouldReconnect && connectionAttempts < MAX_RECONNECT_ATTEMPTS) {
           connectionAttempts++;
@@ -278,11 +250,12 @@ async function connectToWhatsApp() {
     });
 
   } catch (error) {
-    logger.error('❌ Error en connectToWhatsApp:');
-    logger.error(error);
-    console.error('Error completo:', error);
+    logger.error('❌ Error en connectToWhatsApp:', error.message);
+    logger.error('Stack:', error.stack);
+    
     connectionAttempts++;
     if (connectionAttempts < MAX_RECONNECT_ATTEMPTS) {
+      logger.info(`🔄 Reintentando en 5 segundos...`);
       setTimeout(() => connectToWhatsApp(), 5000);
     }
   }
@@ -293,8 +266,9 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'Baileys WhatsApp API',
-    version: '1.0.1',
+    version: '1.0.2',
     connected: isConnected,
+    hasQR: !!qrCodeData,
     timestamp: new Date().toISOString()
   });
 });
@@ -311,7 +285,8 @@ app.get('/qr', async (req, res) => {
     return res.json({
       status: 'waiting',
       message: 'Esperando QR Code... Intenta de nuevo en 2-3 segundos',
-      hint: 'El servidor está generando el QR. Recarga esta página.'
+      hint: 'El servidor está generando el QR. Recarga esta página.',
+      connectionAttempts
     });
   }
 
@@ -327,6 +302,7 @@ app.get('/status', (req, res) => {
     connected: isConnected,
     hasQR: !!qrCodeData,
     connectionAttempts,
+    maxAttempts: MAX_RECONNECT_ATTEMPTS,
     timestamp: new Date().toISOString()
   });
 });
@@ -430,14 +406,10 @@ app.listen(PORT, async () => {
   
   // Inicializar base de datos primero
   logger.info(`🔧 Inicializando base de datos...`);
-  const dbReady = await initDatabase();
+  await initDatabase();
   
-  if (dbReady) {
-    logger.info(`📱 Conectando a WhatsApp...`);
-    connectToWhatsApp();
-  } else {
-    logger.error(`❌ No se pudo inicializar la base de datos. Verifica DATABASE_URL.`);
-  }
+  logger.info(`📱 Conectando a WhatsApp...`);
+  connectToWhatsApp();
 });
 
 // Manejo de errores no capturados
@@ -449,4 +421,3 @@ process.on('uncaughtException', (err) => {
   logger.error('❌ Uncaught Exception:', err);
   process.exit(1);
 });
-
