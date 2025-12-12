@@ -141,20 +141,35 @@ async function connectToWhatsApp() {
     // Captura detallada del error
     logger.error('❌ ERROR CAPTURADO EN CATCH:');
     logger.error(`   Tipo: ${typeof error}`);
-    logger.error(`   Nombre: ${error?.name}`);
-    logger.error(`   Mensaje: ${error?.message}`);
-    logger.error(`   Code: ${error?.code}`);
+    logger.error(`   Nombre: ${error?.name || 'N/A'}`);
+    logger.error(`   Mensaje: ${error?.message || 'SIN MENSAJE'}`);
+    logger.error(`   Code: ${error?.code || 'N/A'}`);
+    logger.error(`   Constructor: ${error?.constructor?.name || 'N/A'}`);
     
-    if (error?.stack) {
-      logger.error('   Stack:', error.stack);
+    // Intentar obtener más info
+    try {
+      logger.error(`   JSON: ${JSON.stringify(error, null, 2)}`);
+    } catch (e) {
+      logger.error('   (No se pudo serializar a JSON)');
     }
     
-    // Log del objeto completo
+    if (error?.stack) {
+      logger.error('   Stack:');
+      logger.error(error.stack);
+    }
+    
+    // FORZAR console.error para que Railway lo capture
     console.error('\n========== ERROR COMPLETO ==========');
-    console.error(error);
+    console.error('Tipo:', typeof error);
+    console.error('Error object:', error);
+    console.error('Keys:', Object.keys(error));
+    console.error('Props:', Object.getOwnPropertyNames(error));
+    if (error?.stack) {
+      console.error('Stack:', error.stack);
+    }
     console.error('====================================\n');
     
-    lastError = error?.message || 'Error desconocido al conectar';
+    lastError = error?.message || error?.toString() || 'Error desconocido al conectar';
     
     connectionAttempts++;
     if (connectionAttempts < MAX_RECONNECT_ATTEMPTS) {
