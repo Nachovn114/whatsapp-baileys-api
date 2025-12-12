@@ -1,11 +1,9 @@
 import baileys from '@whiskeysockets/baileys';
-const { 
-  default: makeWASocket,
-  DisconnectReason, 
-  fetchLatestBaileysVersion,
-  useMultiFileAuthState,
-  makeCacheableSignalKeyStore
-} = baileys;
+const makeWASocket = baileys.default;
+const DisconnectReason = baileys.DisconnectReason;
+const fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion;
+const useMultiFileAuthState = baileys.useMultiFileAuthState;
+const makeCacheableSignalKeyStore = baileys.makeCacheableSignalKeyStore;
 import express from 'express';
 import QRCode from 'qrcode';
 import pino from 'pino';
