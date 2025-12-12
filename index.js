@@ -2,9 +2,7 @@ import pkg from '@whiskeysockets/baileys';
 const { 
   default: makeWASocket,
   DisconnectReason, 
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore
+  fetchLatestBaileysVersion
 } = pkg;
 import express from 'express';
 import QRCode from 'qrcode';
@@ -31,21 +29,32 @@ const logger = pino({
   level: process.env.LOG_LEVEL || 'info'
 });
 
+// Almacenamiento de auth en memoria (para Railway)
+let authState = {
+  creds: null,
+  keys: {}
+};
+
 // Inicializar WhatsApp
 async function connectToWhatsApp() {
   try {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     const { version, isLatest } = await fetchLatestBaileysVersion();
     
     logger.info(`Using Baileys v${version.join('.')}, isLatest: ${isLatest}`);
 
+    // Si no hay credenciales, inicializar vacías
+    if (!authState.creds) {
+      authState.creds = {};
+      authState.keys = {};
+    }
+
     sock = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
-      printQRInTerminal: false, // Lo manejamos manualmente
+      printQRInTerminal: false,
       auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger)
+        creds: authState.creds,
+        keys: authState.keys
       },
       getMessage: async () => ({ conversation: 'Hello' }),
       browser: ['Esika Lorena', 'Chrome', '10.0.0'],
@@ -92,7 +101,10 @@ async function connectToWhatsApp() {
       }
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', (creds) => {
+      authState.creds = creds;
+      logger.info('✅ Credenciales actualizadas en memoria');
+    });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       logger.info(`📨 Nuevo mensaje recibido (${type})`);
