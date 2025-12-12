@@ -208,21 +208,14 @@ async function useCustomPostgresAuthState(sessionId) {
 
 // Inicializar WhatsApp
 async function connectToWhatsApp() {
-  let dbClient = null;
-  
   try {
     const { version, isLatest } = await fetchLatestBaileysVersion();
     
     logger.info(`Using Baileys v${version.join('.')}, isLatest: ${isLatest}`);
 
-    const DATABASE_URL = process.env.DATABASE_URL || process.env.PGURL;
-    
-    if (!DATABASE_URL) {
-      throw new Error('DATABASE_URL no está configurada. Agrega una base de datos PostgreSQL en Railway.');
-    }
-
-    const { state, saveCreds, client } = await useCustomPostgresAuthState('lorena-whatsapp');
-    dbClient = client;
+    // Usar almacenamiento en memoria simple
+    const { useMultiFileAuthState } = await import('@whiskeysockets/baileys');
+    const { state, saveCreds } = await useMultiFileAuthState('./auth_session');
 
     sock = makeWASocket({
       version,
