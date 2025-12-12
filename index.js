@@ -1,9 +1,11 @@
-import makeWASocket, { 
+import pkg from '@whiskeysockets/baileys';
+const { 
+  default: makeWASocket,
   DisconnectReason, 
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore
-} from '@whiskeysockets/baileys';
+} = pkg;
 import express from 'express';
 import QRCode from 'qrcode';
 import pino from 'pino';
