@@ -9,8 +9,6 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import cors from 'cors';
 import { Boom } from '@hapi/boom';
-import postgresBaileys from 'postgres-baileys';
-const { usePostgreSQLAuthState } = postgresBaileys;
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -75,24 +73,116 @@ async function initDatabase() {
   }
 }
 
+// Función para crear auth state personalizado con PostgreSQL
+async function useCustomPostgresAuthState(sessionId) {
+  const DATABASE_URL = process.env.DATABASE_URL || process.env.PGURL;
+  
+  if (!DATABASE_URL) {
+    throw new Error('DATABASE_URL no configurada');
+  }
+
+  const { default: pg } = await import('pg');
+  const { Client } = pg;
+  const client = new Client({ connectionString: DATABASE_URL });
+  await client.connect();
+
+  // Leer datos de la sesión
+  const readData = async (key) => {
+    try {
+      const result = await client.query(
+        'SELECT data_value FROM auth_data WHERE session_id = $1 AND data_key = $2',
+        [sessionId, key]
+      );
+      if (result.rows.length > 0) {
+        return JSON.parse(result.rows[0].data_value);
+      }
+      return null;
+    } catch (error) {
+      logger.error(`Error leyendo ${key}:`, error.message);
+      return null;
+    }
+  };
+
+  // Escribir datos de la sesión
+  const writeData = async (key, data) => {
+    try {
+      await client.query(
+        `INSERT INTO auth_data (session_id, data_key, data_value) 
+         VALUES ($1, $2, $3) 
+         ON CONFLICT (session_id, data_key) 
+         DO UPDATE SET data_value = $3`,
+        [sessionId, key, JSON.stringify(data)]
+      );
+    } catch (error) {
+      logger.error(`Error escribiendo ${key}:`, error.message);
+    }
+  };
+
+  // Leer credenciales
+  const creds = await readData('creds') || {
+    noiseKey: null,
+    signedIdentityKey: null,
+    signedPreKey: null,
+    registrationId: null,
+    advSecretKey: null,
+    nextPreKeyId: null,
+    firstUnuploadedPreKeyId: null,
+    serverHasPreKeys: false
+  };
+
+  // Leer keys
+  const keys = await readData('keys') || {};
+
+  const state = {
+    creds,
+    keys: {
+      get: async (type, ids) => {
+        const data = {};
+        for (const id of ids) {
+          const key = `${type}-${id}`;
+          const value = keys[key];
+          if (value) {
+            data[id] = value;
+          }
+        }
+        return data;
+      },
+      set: async (data) => {
+        for (const category in data) {
+          for (const id in data[category]) {
+            const key = `${category}-${id}`;
+            keys[key] = data[category][id];
+          }
+        }
+        await writeData('keys', keys);
+      }
+    }
+  };
+
+  const saveCreds = async () => {
+    await writeData('creds', state.creds);
+  };
+
+  return { state, saveCreds, client };
+}
+
 // Inicializar WhatsApp
 async function connectToWhatsApp() {
+  let dbClient = null;
+  
   try {
     const { version, isLatest } = await fetchLatestBaileysVersion();
     
     logger.info(`Using Baileys v${version.join('.')}, isLatest: ${isLatest}`);
 
-    // Usar PostgreSQL para almacenar la sesión
     const DATABASE_URL = process.env.DATABASE_URL || process.env.PGURL;
     
     if (!DATABASE_URL) {
       throw new Error('DATABASE_URL no está configurada. Agrega una base de datos PostgreSQL en Railway.');
     }
 
-    const { state, saveCreds } = await usePostgreSQLAuthState({
-      connectionString: DATABASE_URL,
-      sessionId: 'lorena-whatsapp'
-    });
+    const { state, saveCreds, client } = await useCustomPostgresAuthState('lorena-whatsapp');
+    dbClient = client;
 
     sock = makeWASocket({
       version,
