@@ -122,9 +122,48 @@ async function useCustomPostgresAuthState(sessionId) {
   let creds = await readData('creds');
   
   if (!creds) {
-    // Importar initAuthCreds de Baileys
-    const { initAuthCreds } = await import('@whiskeysockets/baileys/lib/Utils/auth-utils.js');
-    creds = initAuthCreds();
+    // Generar credenciales manualmente
+    const crypto = await import('crypto');
+    const { Curve, signedKeyPair } = await import('@whiskeysockets/baileys/lib/Utils/crypto.js');
+    
+    const identityKeyPair = Curve.generateKeyPair();
+    const signedPreKey = signedKeyPair(identityKeyPair, 1);
+    const registrationId = crypto.randomBytes(2).readUInt16BE(0) & 0x3fff;
+    
+    creds = {
+      noiseKey: {
+        private: Buffer.from(Curve.generateKeyPair().private).toString('base64'),
+        public: Buffer.from(Curve.generateKeyPair().public).toString('base64')
+      },
+      signedIdentityKey: {
+        private: Buffer.from(identityKeyPair.private).toString('base64'),
+        public: Buffer.from(identityKeyPair.public).toString('base64')
+      },
+      signedPreKey: {
+        keyPair: {
+          private: Buffer.from(signedPreKey.keyPair.private).toString('base64'),
+          public: Buffer.from(signedPreKey.keyPair.public).toString('base64')
+        },
+        signature: Buffer.from(signedPreKey.signature).toString('base64'),
+        keyId: signedPreKey.keyId
+      },
+      registrationId,
+      advSecretKey: crypto.randomBytes(32).toString('base64'),
+      nextPreKeyId: 1,
+      firstUnuploadedPreKeyId: 1,
+      serverHasPreKeys: false,
+      account: {
+        details: Buffer.from([]).toString('base64'),
+        accountSignatureKey: Buffer.from([]).toString('base64'),
+        accountSignature: Buffer.from([]).toString('base64'),
+        deviceSignature: Buffer.from([]).toString('base64')
+      },
+      me: undefined,
+      signalIdentities: [],
+      myAppStateKeyId: undefined,
+      platform: 'unknown'
+    };
+    
     await writeData('creds', creds);
     logger.info('🆕 Credenciales iniciales creadas');
   } else {
