@@ -31,6 +31,50 @@ const logger = pino({
   level: process.env.LOG_LEVEL || 'info'
 });
 
+// Función para inicializar la base de datos
+async function initDatabase() {
+  const DATABASE_URL = process.env.DATABASE_URL || process.env.PGURL;
+  
+  if (!DATABASE_URL) {
+    logger.error('DATABASE_URL no configurada');
+    return false;
+  }
+
+  try {
+    const { default: pg } = await import('pg');
+    const { Client } = pg;
+    const client = new Client({ connectionString: DATABASE_URL });
+    
+    await client.connect();
+    logger.info('🔌 Conectado a PostgreSQL');
+    
+    // Eliminar tabla incorrecta si existe
+    await client.query('DROP TABLE IF EXISTS auth_data CASCADE');
+    logger.info('🗑️ Tabla anterior eliminada');
+    
+    // Crear tabla correcta
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS auth_data (
+        session_id VARCHAR(255) NOT NULL,
+        data_key VARCHAR(255) NOT NULL,
+        data_value TEXT,
+        PRIMARY KEY (session_id, data_key)
+      )
+    `);
+    logger.info('✅ Tabla auth_data creada correctamente');
+    
+    // Crear índice
+    await client.query('CREATE INDEX IF NOT EXISTS idx_session_id ON auth_data(session_id)');
+    logger.info('✅ Índice creado');
+    
+    await client.end();
+    return true;
+  } catch (error) {
+    logger.error('❌ Error inicializando base de datos:', error);
+    return false;
+  }
+}
+
 // Inicializar WhatsApp
 async function connectToWhatsApp() {
   try {
@@ -248,16 +292,25 @@ app.get('/health', (req, res) => {
 });
 
 // Iniciar servidor
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   logger.info(`🚀 Servidor corriendo en puerto ${PORT}`);
-  logger.info(`📱 Conectando a WhatsApp...`);
   logger.info(`🌐 Endpoints disponibles:`);
   logger.info(`   GET  / - Estado del servidor`);
   logger.info(`   GET  /qr - Obtener QR Code`);
   logger.info(`   GET  /status - Estado de conexión`);
   logger.info(`   POST /send-message - Enviar mensaje`);
   logger.info(`   POST /send-image - Enviar imagen`);
-  connectToWhatsApp();
+  
+  // Inicializar base de datos primero
+  logger.info(`🔧 Inicializando base de datos...`);
+  const dbReady = await initDatabase();
+  
+  if (dbReady) {
+    logger.info(`📱 Conectando a WhatsApp...`);
+    connectToWhatsApp();
+  } else {
+    logger.error(`❌ No se pudo inicializar la base de datos. Verifica DATABASE_URL.`);
+  }
 });
 
 // Manejo de errores no capturados
