@@ -9,7 +9,8 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import cors from 'cors';
 import { Boom } from '@hapi/boom';
-import { usePostgresAuthState } from 'postgres-baileys';
+import postgresBaileys from 'postgres-baileys';
+const { usePostgresAuthState } = postgresBaileys;
 
 const app = express();
 const PORT = process.env.PORT || 8080;
