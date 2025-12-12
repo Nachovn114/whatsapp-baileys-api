@@ -9,11 +9,9 @@ import express from 'express';
 import QRCode from 'qrcode';
 import pino from 'pino';
 import cors from 'cors';
-import { Boom } from '@hapi/boom';
-import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
+import pg from 'pg';
 
+const { Client } = pg;
 const app = express();
 const PORT = process.env.PORT || 8080;
 
@@ -38,20 +36,18 @@ async function initDatabase() {
   const DATABASE_URL = process.env.DATABASE_URL || process.env.PGURL;
   
   if (!DATABASE_URL) {
-    logger.error('DATABASE_URL no configurada');
+    logger.error('❌ DATABASE_URL no configurada');
     return false;
   }
 
   try {
-    const { default: pg } = await import('pg');
-    const { Client } = pg;
     const client = new Client({ connectionString: DATABASE_URL });
     
     await client.connect();
     logger.info('🔌 Conectado a PostgreSQL');
     
-    // Eliminar tabla incorrecta si existe
-    await client.query('DROP TABLE IF EXISTS auth_data CASCADE');
+    // Eliminar tabla anterior si existe
+    await client.query('DROP TABLE IF EXISTS auth_state CASCADE');
     logger.info('🗑️ Tabla anterior eliminada');
     
     // Crear tabla correcta
@@ -67,7 +63,7 @@ async function initDatabase() {
     await client.end();
     return true;
   } catch (error) {
-    logger.error('❌ Error inicializando base de datos:', error);
+    logger.error('❌ Error inicializando base de datos:', error.message);
     return false;
   }
 }
@@ -81,9 +77,6 @@ async function usePostgresAuthState() {
     return await useMultiFileAuthState('./auth_session');
   }
 
-  const { default: pg } = await import('pg');
-  const { Client } = pg;
-  
   const readData = async (key) => {
     const client = new Client({ connectionString: DATABASE_URL });
     try {
@@ -99,8 +92,8 @@ async function usePostgresAuthState() {
       }
       return null;
     } catch (error) {
-      logger.error(`Error leyendo ${key}:`, error.message);
-      await client.end();
+      logger.error(`❌ Error leyendo ${key}:`, error.message);
+      try { await client.end(); } catch (e) {}
       return null;
     }
   };
@@ -118,8 +111,8 @@ async function usePostgresAuthState() {
       );
       await client.end();
     } catch (error) {
-      logger.error(`Error escribiendo ${key}:`, error.message);
-      await client.end();
+      logger.error(`❌ Error escribiendo ${key}:`, error.message);
+      try { await client.end(); } catch (e) {}
     }
   };
 
@@ -130,8 +123,8 @@ async function usePostgresAuthState() {
       await client.query('DELETE FROM auth_state WHERE key = $1', [key]);
       await client.end();
     } catch (error) {
-      logger.error(`Error eliminando ${key}:`, error.message);
-      await client.end();
+      logger.error(`❌ Error eliminando ${key}:`, error.message);
+      try { await client.end(); } catch (e) {}
     }
   };
 
@@ -170,7 +163,9 @@ async function usePostgresAuthState() {
       }
     },
     saveCreds: async () => {
-      await writeData('creds', sock.authState.creds);
+      if (sock && sock.authState && sock.authState.creds) {
+        await writeData('creds', sock.authState.creds);
+      }
     }
   };
 }
@@ -178,13 +173,17 @@ async function usePostgresAuthState() {
 // Inicializar WhatsApp
 async function connectToWhatsApp() {
   try {
-    const { version, isLatest } = await fetchLatestBaileysVersion();
+    logger.info('🔄 Iniciando conexión a WhatsApp...');
     
-    logger.info(`Using Baileys v${version.join('.')}, isLatest: ${isLatest}`);
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    logger.info(`📦 Using Baileys v${version.join('.')}, isLatest: ${isLatest}`);
 
     // Usar auth state de PostgreSQL o filesystem
+    logger.info('📂 Cargando auth state...');
     const { state, saveCreds } = await usePostgresAuthState();
+    logger.info('✅ Auth state cargado');
 
+    logger.info('🔌 Creando socket de WhatsApp...');
     sock = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
@@ -195,6 +194,8 @@ async function connectToWhatsApp() {
       markOnlineOnConnect: true,
       getMessage: async () => undefined
     });
+    
+    logger.info('✅ Socket de WhatsApp creado');
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
@@ -212,7 +213,7 @@ async function connectToWhatsApp() {
           qrCodeData = await QRCode.toDataURL(qr);
           logger.info('✅ QR Code convertido a imagen exitosamente');
         } catch (err) {
-          logger.error('❌ Error generando QR imagen:', err);
+          logger.error('❌ Error generando QR imagen:', err.message);
         }
       }
 
@@ -249,14 +250,20 @@ async function connectToWhatsApp() {
       logger.info(`📨 Nuevo mensaje recibido (${type})`);
     });
 
+    logger.info('✅ Conexión a WhatsApp iniciada correctamente');
+
   } catch (error) {
     logger.error('❌ Error en connectToWhatsApp:', error.message);
-    logger.error('Stack:', error.stack);
+    logger.error('📋 Error completo:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
+    logger.error('🔍 Stack trace:', error.stack);
     
     connectionAttempts++;
     if (connectionAttempts < MAX_RECONNECT_ATTEMPTS) {
-      logger.info(`🔄 Reintentando en 5 segundos...`);
+      logger.info(`🔄 Reintentando en 5 segundos... (${connectionAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
       setTimeout(() => connectToWhatsApp(), 5000);
+    } else {
+      logger.error('❌ Máximo de reintentos alcanzado. No se pudo conectar a WhatsApp.');
+      connectionAttempts = 0;
     }
   }
 }
@@ -266,7 +273,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'Baileys WhatsApp API',
-    version: '1.0.2',
+    version: '1.0.3',
     connected: isConnected,
     hasQR: !!qrCodeData,
     timestamp: new Date().toISOString()
@@ -414,10 +421,12 @@ app.listen(PORT, async () => {
 
 // Manejo de errores no capturados
 process.on('unhandledRejection', (err) => {
-  logger.error('❌ Unhandled Rejection:', err);
+  logger.error('❌ Unhandled Rejection:', err.message);
+  logger.error('📋 Stack:', err.stack);
 });
 
 process.on('uncaughtException', (err) => {
-  logger.error('❌ Uncaught Exception:', err);
-  process.exit(1);
+  logger.error('❌ Uncaught Exception:', err.message);
+  logger.error('📋 Stack:', err.stack);
+  // No salir inmediatamente en Railway
 });
