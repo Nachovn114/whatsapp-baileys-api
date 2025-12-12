@@ -119,16 +119,17 @@ async function useCustomPostgresAuthState(sessionId) {
   };
 
   // Leer credenciales
-  const creds = await readData('creds') || {
-    noiseKey: null,
-    signedIdentityKey: null,
-    signedPreKey: null,
-    registrationId: null,
-    advSecretKey: null,
-    nextPreKeyId: null,
-    firstUnuploadedPreKeyId: null,
-    serverHasPreKeys: false
-  };
+  let creds = await readData('creds');
+  
+  if (!creds) {
+    // Importar initAuthCreds de Baileys
+    const { initAuthCreds } = await import('@whiskeysockets/baileys/lib/Utils/auth-utils.js');
+    creds = initAuthCreds();
+    await writeData('creds', creds);
+    logger.info('🆕 Credenciales iniciales creadas');
+  } else {
+    logger.info('📂 Credenciales existentes cargadas');
+  }
 
   // Leer keys
   const keys = await readData('keys') || {};
