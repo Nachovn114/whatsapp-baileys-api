@@ -97,7 +97,9 @@ async function connectToWhatsApp() {
     });
 
   } catch (error) {
-    logger.error('❌ Error en connectToWhatsApp:', error);
+    logger.error('❌ Error en connectToWhatsApp:');
+    logger.error(error);
+    console.error('Error completo:', error);
     connectionAttempts++;
     if (connectionAttempts < MAX_RECONNECT_ATTEMPTS) {
       setTimeout(() => connectToWhatsApp(), 5000);
