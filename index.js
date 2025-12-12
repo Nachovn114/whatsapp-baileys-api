@@ -198,6 +198,9 @@ async function connectToWhatsApp() {
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
+      
+      // Log completo para debugging
+      logger.info(`📡 Connection Update: ${JSON.stringify({ connection, hasQR: !!qr, hasError: !!lastDisconnect?.error })}`);
 
       if (qr) {
         logger.info('📱 QR Code generado');
@@ -213,8 +216,9 @@ async function connectToWhatsApp() {
       if (connection === 'close') {
         const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const errorMessage = lastDisconnect?.error?.message;
         
-        logger.warn(`❌ Conexión cerrada. StatusCode: ${statusCode}, Reconectar: ${shouldReconnect}`);
+        logger.warn(`❌ Conexión cerrada. StatusCode: ${statusCode}, Error: ${errorMessage}, Reconectar: ${shouldReconnect}`);
         isConnected = false;
         
         if (shouldReconnect && connectionAttempts < MAX_RECONNECT_ATTEMPTS) {
